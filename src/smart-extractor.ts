@@ -287,10 +287,9 @@ export class SmartExtractor {
     let survivingCandidates = capped;
     try {
       const abstracts = capped.map((c) => c.abstract);
-      const vectors = await Promise.all(
-        abstracts.map((a) => this.embedder.embed(a).catch(() => [] as number[])),
-      );
-      const dedupResult = batchDedup(abstracts, vectors);
+      const vectors = await this.embedder.embedBatch(abstracts);
+      const safeVectors = vectors.map((v) => v || []);
+      const dedupResult = batchDedup(abstracts, safeVectors);
       if (dedupResult.duplicateIndices.length > 0) {
         survivingCandidates = dedupResult.survivingIndices.map((i) => capped[i]);
         stats.skipped += dedupResult.duplicateIndices.length;
@@ -305,7 +304,35 @@ export class SmartExtractor {
     }
 
     // Step 2: Process each surviving candidate through dedup pipeline
-    for (const candidate of survivingCandidates) {
+    // Pre-compute vectors for non-profile candidates in a single batch API call
+    // to reduce embedding round-trips from N to 1.
+    const precomputedVectors = new Map<number, number[]>();
+    const nonProfileEntries: { index: number; text: string }[] = [];
+    for (let i = 0; i < survivingCandidates.length; i++) {
+      const c = survivingCandidates[i];
+      if (!ALWAYS_MERGE_CATEGORIES.has(c.category)) {
+        nonProfileEntries.push({ index: i, text: `${c.abstract} ${c.content}` });
+      }
+    }
+    if (nonProfileEntries.length > 0) {
+      try {
+        const batchTexts = nonProfileEntries.map((e) => e.text);
+        const batchVectors = await this.embedder.embedBatch(batchTexts);
+        for (let j = 0; j < nonProfileEntries.length; j++) {
+          const vec = batchVectors[j];
+          if (vec && vec.length > 0) {
+            precomputedVectors.set(nonProfileEntries[j].index, vec);
+          }
+        }
+      } catch (err) {
+        this.log(
+          `memory-pro: smart-extractor: batch pre-embed failed, will embed individually: ${String(err)}`,
+        );
+      }
+    }
+
+    for (let idx = 0; idx < survivingCandidates.length; idx++) {
+      const candidate = survivingCandidates[idx];
       if (
         isUserMdExclusiveMemory(
           {
@@ -332,6 +359,7 @@ export class SmartExtractor {
           stats,
           targetScope,
           scopeFilter,
+          precomputedVectors.get(idx),
         );
       } catch (err) {
         this.log(
@@ -351,38 +379,68 @@ export class SmartExtractor {
    * Filter out texts that match noise prototypes by embedding similarity.
    * Long texts (>300 chars) are passed through without checking.
    * Only active when noiseBank is configured and initialized.
+   *
+   * Uses batch embedding to reduce API round-trips from N to 1.
    */
   async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
     const noiseBank = this.config.noiseBank;
     if (!noiseBank || !noiseBank.initialized) return texts;
 
-    const result: string[] = [];
-    for (const text of texts) {
-      // Very short texts lack semantic signal — skip noise check to avoid false positives
-      if (text.length <= 8) {
-        result.push(text);
-        continue;
-      }
-      // Long texts are unlikely to be pure noise queries
-      if (text.length > 300) {
-        result.push(text);
-        continue;
-      }
-      try {
-        const vec = await this.embedder.embed(text);
-        if (!vec || vec.length === 0 || !noiseBank.isNoise(vec)) {
-          result.push(text);
-        } else {
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: embedding noise filtered: ${text.slice(0, 80)}`,
-          );
-        }
-      } catch {
-        // Embedding failed — pass text through
-        result.push(text);
+    // Partition: short/long texts bypass noise check; mid-length need embedding
+    const SHORT_THRESHOLD = 8;
+    const LONG_THRESHOLD = 300;
+    const bypassFlags: boolean[] = texts.map(
+      (t) => t.length <= SHORT_THRESHOLD || t.length > LONG_THRESHOLD,
+    );
+
+    const needsEmbedIndices: number[] = [];
+    const needsEmbedTexts: string[] = [];
+    for (let i = 0; i < texts.length; i++) {
+      if (!bypassFlags[i]) {
+        needsEmbedIndices.push(i);
+        needsEmbedTexts.push(texts[i]);
       }
     }
-    return result;
+
+    // Batch embed all mid-length texts in a single API call
+    let vectors: number[][] = [];
+    if (needsEmbedTexts.length > 0) {
+      try {
+        vectors = await this.embedder.embedBatch(needsEmbedTexts);
+      } catch {
+        // Batch failed — pass all through
+        return texts.slice();
+      }
+    }
+
+    const result: string[] = new Array(texts.length);
+    // First, fill in bypass texts (always kept)
+    for (let i = 0; i < texts.length; i++) {
+      if (bypassFlags[i]) {
+        result[i] = texts[i];
+      }
+    }
+
+    // Then, check noise for embedded texts
+    for (let j = 0; j < needsEmbedIndices.length; j++) {
+      const idx = needsEmbedIndices[j];
+      const vec = vectors[j];
+      if (!vec || vec.length === 0) {
+        result[idx] = texts[idx];
+        continue;
+      }
+      if (noiseBank.isNoise(vec)) {
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: embedding noise filtered: ${texts[idx].slice(0, 80)}`,
+        );
+        // Leave result[idx] as undefined — will be compacted below
+      } else {
+        result[idx] = texts[idx];
+      }
+    }
+
+    // Compact: remove undefined slots (filtered-out entries)
+    return result.filter(Boolean);
   }
 
   /**
@@ -513,6 +571,10 @@ export class SmartExtractor {
 
   /**
    * Process a single candidate memory: dedup → merge/create → store
+   *
+   * @param precomputedVector - Optional pre-embedded vector for the candidate.
+   *   When provided (from batch pre-embedding), skips the per-candidate embed
+   *   call to reduce API round-trips.
    */
   private async processCandidate(
     candidate: CandidateMemory,
@@ -521,6 +583,7 @@ export class SmartExtractor {
     stats: ExtractionStats,
     targetScope: string,
     scopeFilter?: string[],
+    precomputedVector?: number[],
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -541,9 +604,9 @@ export class SmartExtractor {
       return;
     }
 
-    // Embed the candidate for vector dedup
-    const embeddingText = `${candidate.abstract} ${candidate.content}`;
-    const vector = await this.embedder.embed(embeddingText);
+    // Use pre-computed vector if available (batch embed optimization),
+    // otherwise fall back to per-candidate embed call.
+    const vector = precomputedVector ?? await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
     if (!vector || vector.length === 0) {
       this.log("memory-pro: smart-extractor: embedding failed, storing as-is");
       await this.storeCandidate(candidate, vector || [], sessionKey, targetScope);
