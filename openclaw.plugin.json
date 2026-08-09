@@ -297,6 +297,11 @@
         "default": false,
         "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
       },
+      "manualStoreSupersede": {
+        "type": "boolean",
+        "default": false,
+        "description": "Manual-priority store lane: a memory_store that finds a similar existing memory supersedes it instead of being rejected as a duplicate; the manual text always lands verbatim. Off by default to preserve the classic duplicate check."
+      },
       "sessionStrategy": {
         "type": "string",
         "enum": [
@@ -465,6 +470,19 @@
             ],
             "default": "balanced",
             "description": "Named admission tuning preset. Explicit admissionControl fields still override the selected preset."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
           },
           "utilityMode": {
             "type": "string",
@@ -1488,6 +1506,11 @@
               "type": "string"
             },
             "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
+          },
+          "includeGroupChats": {
+            "type": "boolean",
+            "default": true,
+            "description": "Run the reflection distiller for group-chat sessions (session keys carrying a :group: or :channel: segment). Default true; set false to skip reflection generation on group channels."
           }
         }
       },
@@ -1585,6 +1608,10 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Sent only when explicitly configured (as the OpenRouter-compatible reasoning effort field); when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value."
           }
         }
       },
@@ -2240,6 +2267,11 @@
       "help": "Max concurrent reflection runs across all agents (reflections queue in per-agent lanes). Default 1 keeps reflections serialized; raise to allow parallel reflections.",
       "advanced": true
     },
+    "memoryReflection.includeGroupChats": {
+      "label": "Reflect Group Chats",
+      "help": "Run the reflection distiller for group-chat sessions (:group:/:channel: session keys). Default true; set false to skip reflection generation on group channels.",
+      "advanced": true
+    },
     "memoryReflection.messageCount": {
       "label": "Reflection Message Count",
       "help": "Recent messages included in reflection input",
@@ -2289,6 +2321,9 @@
       "label": "Management Tools",
       "help": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions.",
       "advanced": true
+    },
+    "manualStoreSupersede": {
+      "help": "Manual memory_store always lands; a similar existing memory is superseded by it instead of blocking the write (fact-key aware). Default off."
     },
     "mdMirror.enabled": {
       "label": "Markdown Mirror",
